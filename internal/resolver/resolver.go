@@ -4,7 +4,9 @@ import(
 	"bytes"
 	"encoding/binary"
 	"net"
-	"stirngs"
+	"strings"
+	"fmt"
+	"time"
 )
 
 func boolToInt(b bool) int {
@@ -12,6 +14,55 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func (c *Client) ipType() (string, error) {
+	ip := net.ParseIP(c.IpAddress)
+
+	if ip == nil {
+		return "", fmt.Errorf("invalid IP address")
+	}
+
+	if ip.To4() != nil {
+		return "ipv4", nil
+	}
+
+	return "ipv6", nil
+}
+
+func IDMatcher(reqID,respID []byte) bool {
+	return bytes.Equal(reqID,respID)
+}
+
+func appendFromBufferUntilNull(buf *bytes.Buffer) []byte {
+	var result []byte
+
+	for {
+		b,err:=buf.ReadByte()
+		if err!=nil{
+			break
+		}
+
+		result=append(result,b)
+
+		if b==0{
+			break
+		}
+	}
+	return result
+}
+
+func parseRData(typ uint16, rdata []byte, messageBuf *bytes.Buffer) (string,error){
+
+	switch typ {
+
+	case 1: 
+		ip := net.IP(rdata)
+		return ip.String(),nil
+
+	default:
+		return "",nil
+	}
 }
 
 type Header struct{
@@ -92,7 +143,7 @@ func (q* Question) ToBytes() []byte{
 
 type DNSMessage struct{
 	Header Header
-	Question []Question
+	Questions []Question
 	Answers []ResourceRecord
 	AuthorityRRs []ResourceRecord
 	AdditionalRRs []ResourceRecord
@@ -125,8 +176,8 @@ func NewDNSMessage(header Header,questions []Question,records ...[]ResourceRecor
 }
 
 type Client struct{
-	ipAddress string
-	port int
+	IpAddress string
+	Port int
 }
 
 func (c*Client) Query(message []byte) ([]byte,error){
@@ -137,8 +188,127 @@ func (c*Client) Query(message []byte) ([]byte,error){
 	}
 
 	if ipType=="ipv4"{
-		addr:=fmt.Sprintf("%s:%d",c.ipAddress,c.port)
+		addr=fmt.Sprintf("%s:%d",c.IpAddress,c.Port)
 	} else if ipType=="ipv6"{
-		addr=fmt.Sprint
+		addr=fmt.Sprintf("[%s]:%d",c.IpAddress,c.Port)
 	}
+
+	conn,err:=net.Dial("udp",addr)
+	if err!=nil{
+		return nil,fmt.Errorf("Failed to connect to the DNS Server:%v",err)
+	}
+
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(5*time.Second))
+
+	_,err=conn.Write(message)
+	if err!=nil{
+		return nil,fmt.Errorf("failed to send the DNS message: %v",err)
+	}
+
+	buf := make([]byte,1024)
+
+	n,err:=conn.Read(buf)
+
+	if err!=nil{
+		return nil,fmt.Errorf("Failed to read the response:%v",err)
+	}
+
+	response:=buf[:n]
+
+	if !IDMatcher(message[:2],response[:2]){
+		return nil,fmt.Errorf("The response ID does not match the request ID")
+	}
+
+	return response,nil
+}
+
+type ResourceRecord struct{
+	Name string
+	Type uint16
+	Class uint16
+	TTL uint32
+	RDLength uint16
+	RData []byte
+	RDataParsed string
+}
+
+func ResourceRecordFromBytes(data []byte,messageBufs ...*bytes.Buffer) *ResourceRecord{
+	buf := bytes.NewBuffer(data)
+	var messageBuf *bytes.Buffer
+
+	if messageBufs != nil{
+		messageBuf=messageBufs[0]
+	}
+
+	name:=appendFromBufferUntilNull(buf)
+	nameLength:=len(name)-1
+	decodedName,err:=DecodeName(string(name),messageBuf)
+
+	if err!=nil{
+		fmt.Println("Failed to decode the name:%v\n",err)
+	}
+
+	typ:=binary.BigEndian.Uint16(data[nameLength : nameLength+2])
+	class:=binary.BigEndian.Uint16(data[nameLength+2 : nameLength+4])
+    ttl := binary.BigEndian.Uint32(data[nameLength+4 : nameLength+8])
+    rdLength := binary.BigEndian.Uint16(data[nameLength+8 : nameLength+10])
+    rData := data[nameLength+10 : nameLength+10+int(rdLength)] // 10 is the length of the fields before RData
+    rDataParsed, _ := parseRData(typ, rData, messageBuf)
+
+    return &ResourceRecord{
+        Name: decodedName,
+        Type: typ,
+        Class: class,
+        TTL: ttl,
+        RDLength: rdLength,
+        RData: rData,
+        RDataParsed: rDataParsed,
+    }	
+}
+
+func DecodeName(qname string, messageBufs ...*bytes.Buffer) (string, error) {
+    encoded := []byte(qname)
+    var result bytes.Buffer
+    var messageBuf *bytes.Buffer
+    if messageBufs != nil {
+        messageBuf = messageBufs[0]
+    }
+
+    for i := 0; i < len(encoded); {
+        length := int(encoded[i])
+        if length == 0 {
+            break
+        }
+
+        if encoded[i]>>6 == 0b11 && messageBuf != nil {
+            b := encoded[i+1]
+            offset := int(b & 0b11111111)
+            messageBytes := messageBuf.Bytes()
+            messageBytes = messageBytes[offset:]
+            name := appendFromBufferUntilNull(bytes.NewBuffer(messageBytes))
+            n, _ := DecodeName(string(name))
+            name = []byte(n)
+            length = len(name)
+            if result.Len() > 0 {
+                result.WriteByte('.')
+            }
+            result.Write(name)
+            i += length
+            break
+        }
+        i++
+
+        if i+length > len(encoded) {
+            return "", fmt.Errorf("invalid encoded domain name")
+        }
+        if result.Len() > 0 {
+            result.WriteByte('.')
+        }
+        result.Write(encoded[i : i+length])
+        i += length
+    }
+
+    return result.String(), nil
 }

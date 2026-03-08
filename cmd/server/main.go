@@ -1,77 +1,103 @@
-package main 
+package main
 
 import (
 	"fmt"
 	"net"
-	// "sync"
+
 	"github.com/miekg/dns"
+
+	"DNS_Server/internal/cache"
+	"DNS_Server/internal/resolver"
 )
 
 func main(){
-	addr := &net.UDPAddr{ //struct representing UDP endpoint
-		IP:net.IPv4(0,0,0,0),
-		Port:8053, //53 requires root privilege
-		Zone:"",
-	}
-	conn,err:=net.ListenUDP("udp",addr)
 
-	if err!=nil{
+	addr := &net.UDPAddr{
+		IP: net.IPv4(0,0,0,0),
+		Port:8053,
+	}
+
+	conn,err := net.ListenUDP("udp",addr)
+
+	if err != nil{
 		fmt.Println("Failed to start server:",err)
 		return
 	}
-	fmt.Println("DNS Server running on port :",addr.Port)
+
 	defer conn.Close()
 
+	fmt.Println("DNS Server running on port:",addr.Port)
+
+	cacheStore := cache.NewCache()
+
+	client := resolver.Client{
+		IpAddress:"8.8.8.8",
+		Port:53,
+	}
+
 	for{
-		buf:=make([]byte,1024)
-		
-		n, remoteAddr,err:=conn.ReadFromUDP(buf)
-		if err!=nil{
-			fmt.Println("Error Reading Packet",err)
+
+		buf := make([]byte,1024)
+
+		n,remoteAddr,err := conn.ReadFromUDP(buf)
+
+		if err != nil{
+			fmt.Println("Error Reading Packet:",err)
 			continue
 		}
-		fmt.Println("Received Packet from:", remoteAddr.String())
-		// fmt.Println("Message says:", string(buf[:n]))
+
+		fmt.Println("Received Packet from:",remoteAddr.String())
+
+		queryBytes := buf[:n]
 
 		var msg dns.Msg
 
-		err=msg.Unpack(buf[:n])
-		if err!=nil{
-			fmt.Println("Error in Decoding packet:",err)
+		err = msg.Unpack(queryBytes)
+
+		if err != nil{
+			fmt.Println("Error decoding packet:",err)
 			continue
 		}
 
-		for _, q := range msg.Question {
-			fmt.Println("Query Domain:", q.Name)
-			fmt.Println("Query Type:", dns.TypeToString[q.Qtype])
-		}
+		for _,q := range msg.Question{
 
-		resp:=dns.Msg{}
-		resp.SetReply(&msg)
+			domain := q.Name
+			qtype := dns.TypeToString[q.Qtype]
 
-		for _,q := range msg.Question {
-			fmt.Println("Query Domain:",q.Name)
+			cacheKey := domain + ":" + qtype
 
-			if q.Qtype == dns.TypeA{
-				rr,err:=dns.NewRR(q.Name+" 60 IN A 1.2.3.4") //rr=Resource Record
-				if err!=nil{
-					fmt.Println("RR error",err)
-					continue
+			fmt.Println("Query Domain:",domain)
+			fmt.Println("Query Type:",qtype)
+
+			if resp,found := cacheStore.Get(cacheKey); found{
+
+				fmt.Println("Cache HIT:",cacheKey)
+
+				_,err = conn.WriteToUDP(resp,remoteAddr)
+
+				if err != nil{
+					fmt.Println("Send Error:",err)
 				}
-				resp.Answer=append(resp.Answer,rr)
+
+				continue
+			}
+
+			fmt.Println("Cache MISS:",cacheKey)
+
+			upstreamResp,err := client.Query(queryBytes)
+
+			if err != nil{
+				fmt.Println("Resolver Error:",err)
+				continue
+			}
+
+			cacheStore.Set(cacheKey,upstreamResp)
+
+			_,err = conn.WriteToUDP(upstreamResp,remoteAddr)
+
+			if err != nil{
+				fmt.Println("Send Error:",err)
 			}
 		}
-
-		responseBytes,err:=resp.Pack()  //converting message to bytes
-		if err!=nil{
-			fmt.Println("Packing error",err)
-			continue
-		}
-
-		_,err=conn.WriteToUDP(responseBytes,remoteAddr)
-		if err!=nil{
-			fmt.Println("Send Error:",err)
-		}
-
 	}
 }
