@@ -8,6 +8,7 @@ import (
 
 	"DNS_Server/internal/cache"
 	"DNS_Server/internal/resolver"
+	"DNS_Server/internal/blocklist"
 )
 
 func main(){
@@ -29,9 +30,10 @@ func main(){
 	fmt.Println("DNS Server running on port:",addr.Port)
 
 	cacheStore := cache.NewCache()
+	blocker := blocklist.NewBlockList()
 
 	client := resolver.Client{
-		IpAddress:"8.8.8.8",
+		IpAddress:"1.1.1.1",
 		Port:53,
 	}
 
@@ -69,14 +71,32 @@ func main(){
 			fmt.Println("Query Domain:",domain)
 			fmt.Println("Query Type:",qtype)
 
-			if resp,found := cacheStore.Get(cacheKey); found{
+			if blocker.IsBlocked(domain){
 
-				fmt.Println("Cache HIT:",cacheKey)
+				fmt.Println("Blocked domain:",domain)
 
-				_,err = conn.WriteToUDP(resp,remoteAddr)
+				resp := dns.Msg{}
+				resp.SetReply(&msg)
+				resp.Rcode = dns.RcodeNameError
 
-				if err != nil{
-					fmt.Println("Send Error:",err)
+				responseBytes,_ := resp.Pack()
+
+				conn.WriteToUDP(responseBytes,remoteAddr)
+
+				continue
+			}
+			if resp, found := cacheStore.Get(cacheKey); found {
+
+				fmt.Println("Cache HIT:", cacheKey)
+
+				cachedResp := make([]byte, len(resp))
+				copy(cachedResp, resp)
+
+				copy(cachedResp[0:2], queryBytes[0:2])
+
+				_, err = conn.WriteToUDP(cachedResp, remoteAddr)
+				if err != nil {
+					fmt.Println("Send Error:", err)
 				}
 
 				continue
